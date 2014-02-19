@@ -1,40 +1,32 @@
 #
 # Ping - bounce ICMP identify packets off remote hosts
 #
-# The author of this code (a) does not expect anything from you, and (b)
-# is not responsible for any of the problems you may have using this code.
+#    The author of this code (a) does not expect anything from you, and
+#    (b) is not responsible for any problems you may have using this code.
 #
-# requires: python2
+# requires: python2 and root/administrator privs to use icmp port 22
 # tested on: Arch Linux (as of feb 2014)
+#
+# WORK AROUND FOR RUNNING AS ROOT ON LINUX:
+#
+#   Linux capabilities can be used to grant 'cap_net_raw+ep' to
+#   python scripts by copying the python *binary* to a separate
+#   directory and setting this binary's capabilities with setcap:
+#
+#       $ cp /usr/bin/python2.7 python_net_raw
+#       # setcap cap_net_raw+ep python_net_raw
+#       $ ./python_net_raw ping_monitor.py ...
 
-__date__ = "2014/02/10"
-__version__ = "v0.91"
+__date__ = "2014/02/13"
+__version__ = "v0.92"
 
 import sys
 import time
 
-def dumphex(s):
-    def prntabl(c):
-        return c if ord(c) >= 32 and ord(c) <= 127 else '.'
-
-    bytes = map(lambda x: '%.2x' % x, map(ord, s))
-    if len(s) >= 16:
-        for i in xrange(0, len(bytes) / 16):
-            print '    %-48s %s' % (' '.join(bytes[i*16:(i+1)*16]),
-                                   ''.join(map(prntabl, s[i*16:(i+1)*16])))
-        print '    %-48s %s' % (' '.join(bytes[(i+1)*16:]),
-                                ''.join(map(prntabl, s[(i+1)*16:])))
-    else:
-        print '    %-48s %s' % (' '.join(bytes),
-                                ''.join(map(prntabl, s)))
-
-def logtime():
-    return time.strftime("%H:%M:%S ")
-
 # -----------------------------------------------------------------------
-# A thread based polling service with pause, kill and a few other goodies.
-# Since it polls the function passed, the function needs to return
-# as soon as possible.
+# A thread based polling service with pause and kill.
+# Since it polls the function passed in, the function
+# needs to return as soon as possible.
 
 import threading
 
@@ -62,6 +54,7 @@ class Poll(threading.Thread):
                 self._function(self._args)
             time.sleep(self.period)
 
+    # note: all threads must be killed before python will exit!
     def kill(self):
         self._state = ST_KILLED
 
@@ -82,65 +75,103 @@ class Poll(threading.Thread):
     def __str__(self):
         return self.getName()
 
-def thread_list():
-    """Doesn't list mainthread"""
-    return filter(lambda x: x.getName() != "MainThread", threading.enumerate())
+    @staticmethod
+    def thread_list():
+        return [x for x in threading.enumerate()
+                    if x.getName() != "MainThread"]
 
-def tlist():
-    """Human readable version of thread_list()"""
-    for t in thread_list(): 
-        if isinstance(t, Poll):
-            print "%-16s  %-8s  %4.3f" % (t, t.state(), t.uptime())
+    @staticmethod
+    def tlist():
+        """Human readable version of thread_list()"""
+        for t in Poll.thread_list(): 
+            if isinstance(t, Poll):
+                print "%-16s  %-8s  %4.3f" % (t, t.state(), t.uptime())
 
-def killall():
-    for t in thread_list(): 
-        t.kill()
+    @staticmethod
+    def killall():
+        for t in Poll.thread_list(): 
+            t.kill()
 
 # -----------------------------------------------------------------------
 # ping from scratch
 
 import os
+import types
 import struct
 import socket
 
 class PingService(object):
     """Send out icmp ping requests at 'delay' intervals and
        watch for replies.  The isup() method can be used by
-       other threads to check stats of the remote host.
-       And yes you need root/administrator privs
-       to use the icmp ping service.
+       other threads to check the status of the remote host.
+
+       @host         - (string) ip of host to ping
+       @delay        - (float) delay in seconds between pings
+       @its_dead_jim - (int) seconds to wait before running offline()
+       @verbose      - (bool) print round trip stats for every reply
+       @persistent   - (bool) thread continues to run even if no reply
+
+       usage:       p = PingService('192.168.1.1')
+                    p.start()           - begin ping loop
+                    p.isup()            - True if host has replied recently
+                    p.stop()            - stop ping loop
+
+       online() and offline() methods can be overloaded:
+
+                    def my_online(self):
+                        self.log(self.host + " is up")
+
+                    p.online = types.MethodType(my_online, p)
+
     """
-    def __init__(self, host, delay=1.0, its_dead_jim=4, verbose=False):
+
+    # provide a class-wide thread-safe message queue
+    msgs = []
+
+    def __init__(self, host, delay=1.0, its_dead_jim=4,
+                 verbose=True, persistent=False):
         self.host = host
         self.delay = delay
         self.verbose = verbose
-        self.pronouncement_delay = its_dead_jim * delay
+        self.persistent = persistent
+        self.obituary_delay = its_dead_jim * delay
         socket.setdefaulttimeout(0.01)
-        #print "timeout", socket.getdefaulttimeout()
+        self.started = 0
+        self.thread = None
         self._isup = False
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
                                   socket.getprotobyname('icmp'))
         try:
             self.sock.connect((host, 22))
         except socket.gaierror, ex:
-            print "ping thread cannot connect to %s:" % host, ex[1]
+            self.log("ping socket cannot connect to %s: %s" % (host, ex[1]))
             self.sock.close()
             return
+
+    def log(self, msg):
+        if not self.verbose:
+            msg = time.strftime("%H:%M:%S ") + msg
+        self.msgs.append(msg)
 
     def start(self):
         self.seq = 0
         self.pid = os.getpid()
         self.last_heartbeat = 0
         # send a ping right away
-        self.time_to_send = time.time()
-        self.thread = Poll(self.ping, (None), name=self.host)
-        #retry = 10
-        ## retry for 2 seconds before letting caller deal with a down state
+        self.time_to_send = self.started = time.time()
+        self.thread = Poll(self._ping, (None), name=self.host)
+        #retry = int(round(self.obituary_delay / 0.2))
+        ## retry, before letting caller deal with a down state
         #while retry > 0 and not self._isup:
         #    time.sleep(0.2)
         #    retry -= 1
 
-    def icmp_checksum(self, pkt):
+    def stop(self):
+        if self.thread:
+            self.thread.kill()
+            self.thread = None
+
+    def _icmp_checksum(self, pkt):
         n = len(pkt)
         two_bytes = struct.unpack("!%sH" % (n/2), pkt)
         chksum = sum(two_bytes)
@@ -150,16 +181,16 @@ class PingService(object):
         chksum += chksum >> 16
         return ~chksum & 0xffff
 
-    def icmp_create(self, data):
+    def _icmp_create(self, data):
         fmt = "!BBH"
         args = [8, 0, 0]
         if data and len(data) > 0:
             fmt += "%ss" % len(data)
             args.append(data)
-        args[2] = self.icmp_checksum(struct.pack(fmt, *args))
+        args[2] = self._icmp_checksum(struct.pack(fmt, *args))
         return struct.pack(fmt, *args)
 
-    def icmp_parse(self, pkt):
+    def _icmp_parse(self, pkt):
         """Parse ICMP packet"""
         string_len = len(pkt) - 4 # Ignore IP header
         fmt = "!BBH"
@@ -167,8 +198,8 @@ class PingService(object):
             fmt += "%ss" % string_len
         unpacked_packet = struct.unpack(fmt, pkt)
         typ, code, chksum = unpacked_packet[:3]
-        if self.icmp_checksum(pkt) != 0:
-            print logtime() + "%s reply checksum is not zero" % self.host
+        if self._icmp_checksum(pkt) != 0:
+            self.log("%s reply checksum is not zero" % self.host)
         try:
             data = unpacked_packet[3]
         except IndexError:
@@ -176,19 +207,28 @@ class PingService(object):
         return typ, data
 
 
-    def ping(self, args):
+    def _ping(self, args):
         now = time.time()
         if now >= self.time_to_send:
             # send ping packet 
             self.seq += 1
             self.seq &= 0xffff
             pdata = struct.pack("!HHd", self.pid, self.seq, now)
-            self.sock.send(self.icmp_create(pdata))
+            self.sock.send(self._icmp_create(pdata))
             self.time_to_send = now + self.delay
 
-        if self._isup and now - self.last_heartbeat > self.pronouncement_delay:
+        if self._isup and now - self.last_heartbeat > self.obituary_delay:
             self._isup = False
             self.offline()
+
+        if self.last_heartbeat == 0 \
+        and not self.persistent \
+        and now - self.started > self.obituary_delay:
+            if self.verbose:
+                self.log("no response from " + self.host)
+            self.thread.kill()
+            self.thread = None
+            return
 
         try:
             rbuf = self.sock.recv(10000)
@@ -197,42 +237,39 @@ class PingService(object):
             return
 
         if len(rbuf) <= 20:
-            print logtime() + "%s truncated reply" % self.host
+            self.log("%s truncated reply" % self.host)
             return
 
         # parse ICMP packet; ignore IP header
-        typ, rdata = self.icmp_parse(rbuf[20:])
+        typ, rdata = self._icmp_parse(rbuf[20:])
 
         if typ != 0:
-            print logtime() + "%s packet not an echo reply (%d) " % (
-                                    self.host, typ)
-            dumphex(rbuf)
+            self.log("%s packet not an echo reply (%d) " % (self.host, typ))
             return
 
         if not rdata:
-            print logtime() + "%s packet contains no data" % (self.host)
+            self.log("%s packet contains no data" % (self.host))
             return
 
         if len(rdata) != 12:
-            # print logtime() + "%s not our ping (len=%d)" % (
-            #                        self.host, len(rdata))
+            # other ping programs can cause this
+            # self.log("%s not our ping (len=%d)" % (self.host, len(rdata)))
             return
 
         # parse ping data
         (ident, seqno, timestamp) = struct.unpack("!HHd", rdata)
 
         if ident != self.pid:
-            print logtime() + "%s not our ping (ident=%d)" % (
-                                    self.host, ident)
+            # other instances of PingService can cause this
+            #self.log("%s not our ping (ident=%d)" % (self.host, ident))
             return
 
         if seqno != self.seq:
-            print logtime() + "%s sequence out of order got(%d) expected(%d)" % (
-                                    self.host, seqno, self.seq)
+            self.log("%s sequence out of order " % self.host +
+                     "got(%d) expected(%d)" % (seqno, self.seq))
             return
 
         if rdata and len(rdata) >= 8:
-            #print '.'
             self.last_heartbeat = now
 
             if not self._isup:
@@ -252,125 +289,51 @@ class PingService(object):
                 if rtt > 0:
                     str += ", rtt=%.1f ms" % rtt
 
-                print str
+                self.log(str)
+
+    def online(self):
+        if not self.verbose:
+            self.log("%s is up" % self.host)
+
+    def offline(self):
+        if not self.verbose:
+            self.log("%s is down" % self.host)
 
     def isup(self):
         return self._isup
 
-    def online(self):
-        print logtime() + "%s is up" % self.host
-
-    def offline(self):
-        print logtime() + "%s is down" % self.host
-
-    def stop(self):
-        if 'thread' in dir(self):
-            self.thread.kill()
-        self.sock.close()
-
 # ----------------------------------------------------------------------------
-# demonstrate PingService: heartbeat one or more hosts every 4 seconds
-# (yup, this can be abusive)
+# demonstrate PingService
 
 if __name__ == "__main__":
     import traceback
+    import types
 
     if len(sys.argv) < 2:
-        print "usage: python ping.py <ip|mask|range> [<ip|mask|range> ...]"
+        print "usage: python2 ping.py <ip>"
         sys.exit(1)
 
-    def ip_range(input_string):
-        # (Blender's answer - http://stackoverflow.com/questions/20525330)
-        octets = input_string.split('.')
-        chunks = [map(int, octet.split('-')) for octet in octets]
-        ranges = [range(c[0], c[1] + 1) if len(c) == 2 else c for c in chunks]
-
-        import itertools
-        for address in itertools.product(*ranges):
-            yield '.'.join(map(str, address))
-
-    def mask_to_range(input_string):
-        idx = input_string.find('/')
-        bits = int(input_string[idx+1:])
-        ip = input_string[:idx].rstrip('.').split('.')
-        while len(ip) < 4:
-            ip.append(0)
-        result = []
-        while bits >= 8:
-            result.append(ip.pop(0))
-            bits -= 8
-        if bits > 0:
-            lo = int(ip[0]) & (0xff ^ (0xff >> bits))
-            hi = int(ip[0]) | (0xff >> bits)
-            result.append('%d-%d' % (lo, hi))
-        while len(result) < 4:
-            result.append('0-255')
-        return '.'.join(result)
-
-    addrs = []
-    for arg in sys.argv[1:]:
-        if arg.find('-') > 0 \
-        and arg.replace('.', '').replace('-', '').isdigit():
-            addrs += [addr for addr in ip_range(arg)]
-
-        elif arg.find('/') > 0 \
-        and arg.replace('.', '').replace('/', '').isdigit():
-            addrs += [addr for addr in ip_range(mask_to_range(arg))]
-
-        elif arg.replace('.', '').isdigit():
-            addrs.append(arg)
-
-        else:
-            print "ip [%s] must be a range, a mask, or a single ip" % arg
-            sys.exit(1)
-
-    if len(addrs) == 0:
-        sys.exit(0)
-
-    ping = []
-    for addr in addrs:
-        # pass over ips that end with .0
-        if int(addr.rsplit('.', 1)[-1]) == 0:
-            print "ignoring", addr
-            continue
-
-        try:
-            ping_svc = PingService(addr, delay=4)
-        except socket.error:
-            t, v, tb = sys.exc_info()
-            print addr, ':', str(v)
-            continue
-
-        # don't ping ourself
-        if addr == ping_svc.sock.getsockname()[0]:
-            ping_svc.stop()
-            print "localhost is", addr
-            continue
-
-        ping.append(ping_svc)
-
-    print "%d address%s" % (len(ping), ['', 'es'][len(ping) > 1])
-    if len(ping) == 0:
-        sys.exit(0)
+    ping_svc = PingService(sys.argv[1])
 
     try:
-        for p in ping:
-            p.start()
+        ping_svc.start()
 
-        while True:
-            time.sleep(10)
+        while len(Poll.thread_list()) > 0:
+            time.sleep(ping_svc.delay / 4.0)
+
+            # flush log messages
+            while len(PingService.msgs) > 0:
+                print PingService.msgs.pop(0)
 
     except KeyboardInterrupt:
-        print "---- running threads ----"
-        tlist()
-        print "----"
+        pass
 
     except:
         t, v, tb = sys.exc_info()
         traceback.print_exception(t, v, tb)
 
-    for p in ping:
-        p.stop()
+    # note: all threads must be stopped before python will exit!
+    ping_svc.stop()
 
     sys.exit(0)
 
