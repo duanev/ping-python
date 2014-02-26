@@ -11,14 +11,14 @@
 #
 #   Linux capabilities can be used to grant 'cap_net_raw+ep' to
 #   python scripts by copying the python *binary* to a separate
-#   directory and setting this binary's capabilities with setcap:
+#   directory and setting the copy's capabilities with setcap:
 #
 #       $ cp /usr/bin/python2.7 python_net_raw
 #       # setcap cap_net_raw+ep python_net_raw
 #       $ ./python_net_raw ping_monitor.py ...
 
-__date__ = "2014/02/13"
-__version__ = "v0.92"
+__date__ = "2014/02/26"
+__version__ = "v0.93"
 
 import sys
 import time
@@ -135,6 +135,7 @@ class PingService(object):
         self.verbose = verbose
         self.persistent = persistent
         self.obituary_delay = its_dead_jim * delay
+        self.pad = "getoff my lawn"         # should be 14 chars or more
         socket.setdefaulttimeout(0.01)
         self.started = 0
         self.thread = None
@@ -208,12 +209,13 @@ class PingService(object):
 
 
     def _ping(self, args):
+        pdatafmt = "!HHd%ds" % len(self.pad)
         now = time.time()
         if now >= self.time_to_send:
             # send ping packet 
             self.seq += 1
             self.seq &= 0xffff
-            pdata = struct.pack("!HHd", self.pid, self.seq, now)
+            pdata = struct.pack(pdatafmt, self.pid, self.seq, now, self.pad)
             self.sock.send(self._icmp_create(pdata))
             self.time_to_send = now + self.delay
 
@@ -243,6 +245,14 @@ class PingService(object):
         # parse ICMP packet; ignore IP header
         typ, rdata = self._icmp_parse(rbuf[20:])
 
+        if typ == 8:
+            self.log("%s is pinging us" % self.host)
+            self.last_heartbeat = now
+            if not self._isup:
+                self._isup = True
+                self.online()
+            return
+ 
         if typ != 0:
             self.log("%s packet not an echo reply (%d) " % (self.host, typ))
             return
@@ -251,13 +261,13 @@ class PingService(object):
             self.log("%s packet contains no data" % (self.host))
             return
 
-        if len(rdata) != 12:
+        if len(rdata) != 12 + len(self.pad):
             # other ping programs can cause this
             # self.log("%s not our ping (len=%d)" % (self.host, len(rdata)))
             return
 
         # parse ping data
-        (ident, seqno, timestamp) = struct.unpack("!HHd", rdata)
+        (ident, seqno, timestamp, pad) = struct.unpack(pdatafmt, rdata)
 
         if ident != self.pid:
             # other instances of PingService can cause this
@@ -319,9 +329,9 @@ if __name__ == "__main__":
         ping_svc.start()
 
         while len(Poll.thread_list()) > 0:
-            time.sleep(ping_svc.delay / 4.0)
+            time.sleep(0.2)
 
-            # flush log messages
+            # print log messages
             while len(PingService.msgs) > 0:
                 print PingService.msgs.pop(0)
 
