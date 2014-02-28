@@ -5,19 +5,23 @@
 #    (b) is not responsible for any problems you may have using this code.
 #
 # requires: python2 and root/administrator privs to use icmp port 22
-# tested on: Arch Linux (as of feb 2014)
+# tested on: Arch Linux (as of feb 2014), Windows 8
 #
-# WORK AROUND FOR RUNNING AS ROOT ON LINUX:
+# Linux:
 #
-#   Linux capabilities can be used to grant 'cap_net_raw+ep' to
+#   On Linux capabilities can be used to grant 'cap_net_raw+ep' to
 #   python scripts by copying the python *binary* to a separate
 #   directory and setting the copy's capabilities with setcap:
 #
 #       $ cp /usr/bin/python2.7 python_net_raw
 #       # setcap cap_net_raw+ep python_net_raw
-#       $ ./python_net_raw ping_monitor.py ...
+#       $ ./python_net_raw ping.py ...
+#
+# Windows 8:
+#
+#   Right click icon in lower left of screen, use Command Prompt (Admin)
 
-__date__ = "2014/02/26"
+__date__ = "2014/02/27"
 __version__ = "v0.93"
 
 import sys
@@ -205,7 +209,7 @@ class PingService(object):
             data = unpacked_packet[3]
         except IndexError:
             data = None
-        return typ, data
+        return typ, code, data
 
 
     def _ping(self, args):
@@ -243,7 +247,7 @@ class PingService(object):
             return
 
         # parse ICMP packet; ignore IP header
-        typ, rdata = self._icmp_parse(rbuf[20:])
+        typ, code, rdata = self._icmp_parse(rbuf[20:])
 
         if typ == 8:
             self.log("%s is pinging us" % self.host)
@@ -253,6 +257,10 @@ class PingService(object):
                 self.online()
             return
  
+        if typ == 3:
+            self.log("%s dest unreachable (code=%d)" % (self.host, code));
+            return
+
         if typ != 0:
             self.log("%s packet not an echo reply (%d) " % (self.host, typ))
             return
@@ -289,7 +297,9 @@ class PingService(object):
             if self.verbose:
                 str = "%d bytes from %s: seq=%u" % (
                       len(rbuf),
-                      socket.inet_ntop(socket.AF_INET, rbuf[12:16]), self.seq)
+                      # inet_ntop not available on windows
+                      '.'.join([('%d' % ord(c)) for c in list(rbuf[12:16])]),
+                      self.seq)
 
                 # calculate rounttrip time
                 rtt = now - timestamp
